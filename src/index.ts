@@ -5,6 +5,7 @@ export {declareType, TypedData} from './types';
 export {
     SessionPool,
     Session,
+    ExecDataQuerySettings,
     TableDescription,
     Column,
     TableProfile,
@@ -19,7 +20,8 @@ export {
     ExecutionPolicy,
     CachingPolicy
 } from './table';
-export {getCredentialsFromEnv} from "./parse-env-vars";
+export {BaseRequestSettings} from './request-settings';
+export {getCredentialsFromEnv} from './parse-env-vars';
 export {TokenAuthService} from './credentials';
-export {withRetries, RetryParameters} from "./retries";
+export {withRetries, RetryParameters} from './retries';
 export {YdbError, StatusCode} from './errors';

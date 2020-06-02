@@ -1,14 +1,15 @@
 import _ from 'lodash';
 import EventEmitter from 'events';
-import {Ydb} from "../proto/bundle";
-import {BaseService, ensureOperationSucceeded, getOperationPayload, pessimizable} from "./utils";
+import {Ydb} from '../proto/bundle';
+import {ApiService, BaseService, ensureOperationSucceeded, getOperationPayload, pessimizable} from './utils';
 import {Endpoint} from './discovery';
-import Driver from "./driver";
-import {SESSION_KEEPALIVE_PERIOD} from "./constants";
-import {IAuthService} from "./credentials";
+import Driver from './driver';
+import {SESSION_KEEPALIVE_PERIOD} from './constants';
+import {IAuthService} from './credentials';
 import getLogger, {Logger} from './logging';
-import {retryable} from "./retries";
-import {SchemeError, SessionPoolEmpty} from "./errors";
+import {retryable} from './retries';
+import {BaseRequestSettings} from './request-settings';
+import {SchemeError, SessionPoolEmpty} from './errors';
 
 import TableService = Ydb.Table.V1.TableService;
 import CreateSessionRequest = Ydb.Table.CreateSessionRequest;
@@ -74,11 +75,20 @@ interface IQueryParams {
     [k: string]: Ydb.ITypedValue
 }
 
+export class ExecDataQuerySettings extends BaseRequestSettings {
+    keepInCache: boolean = false;
+
+    withKeepInCash(keepInCache: boolean) {
+        this.keepInCache = keepInCache;
+        return this;
+    }
+}
+
 export class Session extends EventEmitter implements ICreateSessionResult {
     private beingDeleted = false;
     private free = true;
 
-    constructor(private api: TableService, public endpoint: Endpoint, public sessionId: string, private logger: Logger) {
+    constructor(private api: ApiService<TableService>, public endpoint: Endpoint, public sessionId: string, private logger: Logger) {
         super();
     }
 
@@ -112,44 +122,40 @@ export class Session extends EventEmitter implements ICreateSessionResult {
 
     @retryable()
     @pessimizable
-    public async keepAlive(): Promise<void> {
-        ensureOperationSucceeded(await this.api.keepAlive({sessionId: this.sessionId}));
+    public async keepAlive(settings?: BaseRequestSettings): Promise<void> {
+        ensureOperationSucceeded(await this.api(settings).keepAlive({sessionId: this.sessionId}));
     }
 
     @retryable()
     @pessimizable
-    public async createTable(tablePath: string, description: TableDescription): Promise<void> {
-        const {columns, primaryKey, indexes, profile} = description;
-        const request = {
+    public async createTable(tablePath: string, description: TableDescription, settings?: BaseRequestSettings): Promise<void> {
+        const request = Ydb.Table.CreateTableRequest.create({
             sessionId: this.sessionId,
             path: `${this.endpoint.database}/${tablePath}`,
-            columns,
-            primaryKey,
-            indexes,
-            profile
-        };
-        ensureOperationSucceeded(await this.api.createTable(request));
+            ...description
+        });
+        ensureOperationSucceeded(await this.api(settings).createTable(request));
     }
 
     @retryable()
     @pessimizable
-    public async dropTable(tablePath: string): Promise<void> {
+    public async dropTable(tablePath: string, settings?: BaseRequestSettings): Promise<void> {
         const request = {
             sessionId: this.sessionId,
             path: `${this.endpoint.database}/${tablePath}`
         };
         // suppress error when dropping non-existent table
-        ensureOperationSucceeded(await this.api.dropTable(request), [SchemeError.status]);
+        ensureOperationSucceeded(await this.api(settings).dropTable(request), [SchemeError.status]);
     }
 
     @retryable()
     @pessimizable
-    public async describeTable(tablePath: string): Promise<DescribeTableResult> {
+    public async describeTable(tablePath: string, settings?: BaseRequestSettings): Promise<DescribeTableResult> {
         const request = {
             sessionId: this.sessionId,
             path: `${this.endpoint.database}/${tablePath}`
         };
-        const response = await this.api.describeTable(request);
+        const response = await this.api(settings).describeTable(request);
         const payload = getOperationPayload(response);
         return DescribeTableResult.decode(payload);
     }
@@ -191,41 +197,51 @@ export class Session extends EventEmitter implements ICreateSessionResult {
 
     @retryable()
     @pessimizable
-    public async prepareQuery(queryText: string): Promise<PrepareQueryResult> {
+    public async prepareQuery(queryText: string, settings?: BaseRequestSettings): Promise<PrepareQueryResult> {
         const request = {
             sessionId: this.sessionId,
             yqlText: queryText
         };
-        const response = await this.api.prepareDataQuery(request);
+        const response = await this.api(settings).prepareDataQuery(request);
         const payload = getOperationPayload(response);
         return PrepareQueryResult.decode(payload);
     }
 
     @pessimizable
     public async executeQuery(
-        query: PrepareQueryResult | string,
+        query: Ydb.Table.IPrepareQueryResult | string,
         params: IQueryParams = {},
-        txControl: IExistingTransaction | INewTransaction = AUTO_TX
+        txControl: IExistingTransaction | INewTransaction = AUTO_TX,
+        settings?: ExecDataQuerySettings
     ): Promise<ExecuteQueryResult> {
         this.logger.trace('preparedQuery', JSON.stringify(query, null, 2));
         this.logger.trace('parameters', JSON.stringify(params, null, 2));
         let queryToExecute: IQuery;
+        let keepInCache = false;
         if (typeof query === 'string') {
             queryToExecute = {
                 yqlText: query
             };
+
+            if (settings?.keepInCache !== undefined) {
+                keepInCache = settings.keepInCache;
+            }
         } else {
             queryToExecute = {
                 id: query.queryId
             };
         }
-        const request = {
+        const request = Ydb.Table.ExecuteDataQueryRequest.create({
             sessionId: this.sessionId,
             txControl,
             parameters: params,
             query: queryToExecute
-        };
-        const response = await this.api.executeDataQuery(request);
+        });
+        if (keepInCache) {
+            request.queryCachePolicy = Ydb.Table.QueryCachePolicy.create({keepInCache: true});
+        }
+
+        const response = await this.api(settings).executeDataQuery(request);
         const payload = getOperationPayload(response);
         return ExecuteQueryResult.decode(payload);
     }

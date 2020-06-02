@@ -1,12 +1,12 @@
 import grpc, {Metadata} from 'grpc';
 import * as $protobuf from 'protobufjs';
 import _ from 'lodash';
-import {Ydb} from '../proto/bundle';
-import {YdbError, StatusCode, NotFound} from "./errors";
 
+import {google, Ydb} from '../proto/bundle';
+import {YdbError, StatusCode, NotFound, MissingValue, MissingOperation, DeadlineExceed} from './errors';
 import {Endpoint} from './discovery';
 import {IAuthService} from './credentials';
-import {MissingValue, MissingOperation} from './errors';
+import {BaseRequestSettings} from './request-settings';
 
 
 export interface Pessimizable {
@@ -32,7 +32,12 @@ function removeProtocol(entryPoint: string) {
 export abstract class GrpcService<Api extends $protobuf.rpc.Service> {
     protected api: Api;
 
-    protected constructor(host: string, private name: string, private apiCtor: ServiceFactory<Api>, sslCredentials?: ISslCredentials) {
+    protected constructor(
+        host: string,
+        private name: string,
+        private apiCtor: ServiceFactory<Api>,
+        sslCredentials?: ISslCredentials
+    ) {
         this.api = this.getClient(removeProtocol(host), sslCredentials);
     }
 
@@ -48,15 +53,51 @@ export abstract class GrpcService<Api extends $protobuf.rpc.Service> {
     }
 }
 
-export abstract class BaseService<Api extends $protobuf.rpc.Service> {
-    protected api: Api;
-    private metadata: Metadata | null = null;
+const DEFAULT_TIMEOUT = 600; // 10 minutes
+const NANOS_IN_SECOND = 10**9;
+const YDB_TRACE_ID_HEADER = 'x-ydb-trace-id';
 
-    static isServiceAsyncMethod(target: object, prop: string|number|symbol, receiver: any) {
+function getDuration(seconds: number) {
+    return google.protobuf.Duration.create({
+        seconds: Math.floor(seconds),
+        nanos: Math.floor((seconds - Math.floor(seconds)) * NANOS_IN_SECOND)
+    });
+}
+
+async function withTimeoutRequest(request: any, timeout: number) {
+    if (timeout === 0) {
+        return request;
+    }
+    return new Promise(async (resolve, reject) => {
+        const timerId = setTimeout(
+            () => reject(new DeadlineExceed('Deadline exceeded on request')),
+            timeout * 1000
+        );
+        const result = await request;
+        clearTimeout(timerId);
+        resolve(result);
+    });
+}
+
+export type ApiService<T> = {
+    (settings?: BaseRequestSettings): ApiService<T>
+} & T;
+
+export abstract class BaseService<Api extends $protobuf.rpc.Service> {
+    protected api: ApiService<Api>;
+    private service: Api;
+    private metadata: Metadata | null = null;
+    private settings?: BaseRequestSettings;
+
+    /**
+     * All methods that make queries have 2 parameters (request and callback).
+     *
+     * @param property
+     */
+    static isServiceAsyncMethod(property: unknown) {
         return (
-            Reflect.has(target, prop) &&
-            typeof Reflect.get(target, prop, receiver) === 'function' &&
-            prop !== 'create'
+            typeof property === 'function' &&
+            property.length === 2
         );
     }
 
@@ -66,20 +107,54 @@ export abstract class BaseService<Api extends $protobuf.rpc.Service> {
         private apiCtor: ServiceFactory<Api>,
         private authService: IAuthService
     ) {
+        this.service = this.getClient(removeProtocol(host), this.authService.sslCredentials);
         this.api = new Proxy(
-            this.getClient(removeProtocol(host), this.authService.sslCredentials),
+            Object.assign(function(){}),
             {
-                get: (target, prop, receiver) => {
-                    const property = Reflect.get(target, prop, receiver);
-                    return BaseService.isServiceAsyncMethod(target, prop, receiver) ?
-                        async (...args: any[]) => {
+                get: (_target, prop) => {
+                    const property = Reflect.get(this.service, prop);
+                    return BaseService.isServiceAsyncMethod(property) ?
+                        async (request: {operationParams?: Ydb.Operations.IOperationParams}, callback: any) => {
+                            const settings = this.settings;
+                            this.settings = undefined;
+
+                            const timeout = settings?.timeout ?? DEFAULT_TIMEOUT;
+                            const operationTimeout = settings?.operationTimeout ?? timeout;
+                            const cancelAfter = settings?.cancelAfter ?? timeout;
+
+                            request.operationParams = Ydb.Operations.OperationParams.create({
+                                operationTimeout: getDuration(operationTimeout),
+                                cancelAfter: getDuration(cancelAfter)
+                            });
+
                             this.metadata = await this.authService.getAuthMetadata();
-                            return property.call(target, ...args);
+                            if (settings?.traceId !== undefined) {
+                                this.metadata.add(YDB_TRACE_ID_HEADER, settings.traceId);
+                            }
+
+                            if (!callback) {
+                                return withTimeoutRequest(property.call(this.service, request), timeout);
+                            }
+                            const timerId = setTimeout(() => {
+                                callback(new DeadlineExceed('Deadline exceeded on request'), timeout * 1000);
+                            })
+                            property.call(this.service, request, (err: any, res: any) => {
+                                clearTimeout(timerId);
+                                if (err) {
+                                    callback(err);
+                                } else {
+                                    callback(null, res);
+                                }
+                            });
                         } :
                         property;
+                },
+                apply: (_target, _thisArg, [settings]: [BaseRequestSettings]) => {
+                    this.settings = settings;
+                    return this.api;
                 }
             }
-        );
+        ) as unknown as ApiService<Api>;
     }
 
     protected getClient(host: string, sslCredentials?: ISslCredentials): Api {
